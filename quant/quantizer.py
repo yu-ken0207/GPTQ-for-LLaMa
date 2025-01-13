@@ -7,6 +7,7 @@ import math
 class Quantizer(nn.Module):
 
     def __init__(self, shape=1):
+        print("class Quantizer")
         super(Quantizer, self).__init__()
         self.register_buffer('maxq', torch.tensor(0))
         self.register_buffer('scale', torch.zeros(shape))

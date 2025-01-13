@@ -376,7 +376,8 @@ class QuantLinear(nn.Module):
         out = out + self.bias if self.bias is not None else out
         return out.reshape(out_shape)
 
-
+#將模組中指定的線性層替換為量化線性層
+#對於模組中的每個子模組，遞迴調用 make_quant_linear 函式
 def make_quant_linear(module, names, bits, groupsize, name=''):
     if isinstance(module, QuantLinear):
         return

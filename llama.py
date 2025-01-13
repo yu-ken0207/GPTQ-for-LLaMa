@@ -15,31 +15,37 @@ def get_llama(model):
     def skip(*args, **kwargs):
         pass
 
+    #禁用這些初始化函式
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
+
     from transformers import LlamaForCausalLM
     model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
     model.seqlen = 2048
     return model
 
 
-@torch.no_grad()
+@torch.no_grad() #暫時禁用梯度計算
 def llama_sequential(model, dataloader, dev):
-    print('Starting ...')
+    print('llama_sequential is Starting ...')
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
+    use_cache = model.config.use_cache  # 暫存模型配置中是否使用快取的設定
+    model.config.use_cache = False      # 關閉模型配置中的快取功能
+    layers = model.model.layers         # 取得模型中所有層
+    
+    # 遍歷所有層並列印
+    for i, layer in enumerate(layers):
+        print(f"Layer {i}: {layer}")
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
+    model.model.embed_tokens = model.model.embed_tokens.to(dev) # 將模型的嵌入層移到指定的設備上
+    model.model.norm = model.model.norm.to(dev) # 將模型的正規化層移到指定的設備上
+    layers[0] = layers[0].to(dev)       # 將模型的第一層移到指定的設備上
+    dtype = next(iter(model.parameters())).dtype # 取得模型參數的數據類型
+    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev) # 創建一個全零張量，形狀由模型的配置決定
+    cache = {'i': 0, 'attention_mask': None} # 初始化一個快取字典
 
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {'i': 0, 'attention_mask': None}
-
+    # 這個class用於捕獲每個層的輸入和輸出，並將它們存儲到inps中
     class Catcher(nn.Module):
 
         def __init__(self, module):
@@ -53,7 +59,9 @@ def llama_sequential(model, dataloader, dev):
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
 
-    layers[0] = Catcher(layers[0])
+    layers[0] = Catcher(layers[0]) # 將模型的第一層包裝在Catcher中
+
+    # 恢復模型的原始狀態，包括將第一層從Catcher中取出，並將模型的部分層移回CPU，釋放CUDA記憶體。
     for batch in dataloader:
         try:
             model(batch[0].to(dev))
@@ -66,6 +74,7 @@ def llama_sequential(model, dataloader, dev):
     model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
 
+    # 初始化輸出張量outs和從快取中取得attention_mask和position_ids
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
@@ -84,20 +93,29 @@ def llama_sequential(model, dataloader, dev):
         layer = layers[i].to(dev)
         full = find_layers(layer)
         if args.true_sequential:
+            print("args.true_sequential = True","\n")
             sequential = [['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'], ['self_attn.o_proj'], ['mlp.up_proj', 'mlp.gate_proj'], ['mlp.down_proj']]
         else:
+            print("args.true_sequential = False","\n")
             sequential = [list(full.keys())]
+            print("sequential = " , sequential ,"\n")
 
         for names in sequential:
+            print("names = " , names ,"\n")
             subset = {n: full[n] for n in names}
+            print("subset = " , subset ,"\n")
             gptq = {}
             for name in subset:
+                print("name = " , name ,"\n")
+                print("subset[name] = " , subset[name] ,"\n")
                 gptq[name] = GPTQ(subset[name], observe=args.observe)
+                print("GPTQ 結束 ","\n")
                 gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
 
             def add_batch(name):
-
+                print("進入 add_batch","\n")
                 def tmp(_, inp, out):
+                    print("進入 tmp","\n")
                     gptq[name].add_batch(inp[0].data, out.data)
 
                 return tmp
@@ -287,22 +305,24 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
     torch.nn.init.uniform_ = noop
     torch.nn.init.normal_ = noop
 
-    torch.set_default_dtype(torch.half)
+    torch.set_default_dtype(torch.half) #半精度
     modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
     model = LlamaForCausalLM(config)
     torch.set_default_dtype(torch.float)
     if eval:
         model = model.eval()
-    layers = find_layers(model)
-    for name in ['lm_head']:
+    layers = find_layers(model) #找到模型的所有層
+    for name in ['lm_head']: #刪除 'lm_head'
         if name in layers:
             del layers[name]
-    quant.make_quant_linear(model, layers, wbits, groupsize)
+    quant.make_quant_linear(model, layers, wbits, groupsize) #將線性層量化
 
     del layers
 
     print('Loading model ...')
+
+    #加載模型權重
     if checkpoint.endswith('.safetensors'):
         from safetensors.torch import load_file as safe_load
         model.load_state_dict(safe_load(checkpoint))
@@ -310,14 +330,18 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
         model.load_state_dict(torch.load(checkpoint))
 
     if eval:
+        #用注意力和正規化層的量化
         quant.make_quant_attn(model)
         quant.make_quant_norm(model)
         if fused_mlp:
+            #用融合 MLP
             quant.make_fused_mlp(model)
 
     if warmup_autotune:
+        #進行線性層的熱身自動調節
         quant.autotune_warmup_linear(model, transpose=not (eval))
         if eval and fused_mlp:
+            #進行融合 MLP 的熱身自動調節
             quant.autotune_warmup_fused(model)
     model.seqlen = 2048
     print('Done.')
@@ -469,7 +493,11 @@ if __name__ == '__main__':
             When this feature enabled, `--save` or `--save_safetensors` would be disable.')
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
 
+    
     args = parser.parse_args()
+
+
+
 
     if args.layers_dist:
         gpu_dist = [int(x) for x in args.layers_dist.split(':')]
@@ -484,24 +512,30 @@ if __name__ == '__main__':
     else:
         model = get_llama(args.model)
         model.eval()
-
+    
     dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
-
+    
+    #是否要執行量化模型
     if not args.load and args.wbits < 16 and not args.nearest:
         tick = time.time()
+        print("進入llama_sequential"+"\n")
         quantizers = llama_sequential(model, dataloader, DEV)
         print(time.time() - tick)
-
+        
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
+        print("gpus = "+gpus)
         if len(gpus) > 1:
+            print("進入llama_multigpu")
             llama_multigpu(model, gpus, gpu_dist)
         else:
+            print("model.to(DEV)")
             model = model.to(DEV)
         if args.benchmark:
+            print("args.benchmark")
             input_ids = next(iter(dataloader))[0][:, :args.benchmark]
             benchmark(model, input_ids, check=args.check)
-
+    print("結束 args.benchmark")
     if args.eval:
         datasets = ['wikitext2', 'ptb', 'c4']
         if args.new_eval:

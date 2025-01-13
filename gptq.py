@@ -59,18 +59,32 @@ class GPTQ:
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
-        if isinstance(self.layer, nn.Conv2d):
-            W = W.flatten(1)
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        self.rows = W.shape[0]
-        self.columns = W.shape[1]
-        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
-        self.nsamples = 0
-        self.quantizer = quant.Quantizer()
-        self.observe = observe
 
+        print("W = ", W ,"\n")
+
+        if isinstance(self.layer, nn.Conv2d): #如果層是二維卷積層，將權重攤平。
+            W = W.flatten(1)
+            print("W是二維 = ", W ,"\n")
+        if isinstance(self.layer, transformers.Conv1D): #如果層是一維卷積層，將權重轉置。
+            W = W.t()
+            print("W是一維 = ", W ,"\n")
+        self.rows = W.shape[0] #表示權重的行數和列數
+        print("self.rows = ", self.rows ,"\n")
+
+        self.columns = W.shape[1]
+        print("self.columns = ", self.columns ,"\n")
+
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev) #初始化一個零矩陣 H，用於存儲 Hessian 矩陣。
+        self.nsamples = 0  #初始化屬性 nsamples，表示樣本數量。
+
+        print("初始化量化器","\n")
+        self.quantizer = quant.Quantizer() #初始化一個量化器。
+        print("結束初始化量化器","\n")
+        self.observe = observe  #初始化屬性 observe，表示是否啟用觀察模式。
+
+    #用於將每個批次的輸入和輸出添加到 GPTQ 物件中。
     def add_batch(self, inp, out):
+        print("進入add_batch ",self, inp, out ,"\n")
         # Hessian H = 2 X XT + λ I
         if self.observe:
             self.inp1 = inp
@@ -79,26 +93,40 @@ class GPTQ:
             self.inp1 = None
             self.out1 = None
 
-        if len(inp.shape) == 2:
+        if len(inp.shape) == 2:    #如果輸入的形狀是二維的，則將其擴展為三維
             inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
+
+        tmp = inp.shape[0]   #計算批次的大小。
+        
+        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):  #如果層是全連接層或一維卷積層，則將輸入轉置並調整形狀。
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
+
+        if isinstance(self.layer, nn.Conv2d):   #如果層是二維卷積層，則將輸入展開並調整形狀。
             unfold = nn.Unfold(self.layer.kernel_size, dilation=self.layer.dilation, padding=self.layer.padding, stride=self.layer.stride)
             inp = unfold(inp)
             inp = inp.permute([1, 0, 2])
             inp = inp.flatten(1)
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        # inp = inp.float()
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        self.H += inp.matmul(inp.t())
 
+        #更新 Hessian 矩陣
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        print("self.H = ",self.H,"\n")
+        
+        self.nsamples += tmp
+        print("self.nsamples = ",self.nsamples,"\n")
+
+        # inp = inp.float()
+        inp = math.sqrt(2 / self.nsamples) * inp.float()  #對輸入進行正歸化
+        print("inp = ",inp,"\n")
+
+        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
+        self.H += inp.matmul(inp.t())  #更新 Hessian 矩陣。
+        print("self.H = ",self.H,"\n")
+
+    #用於打印量化結果
     def print_loss(self, name, q_weight, weight_error, timecost):
+        print("進入print_loss = ",self, name, q_weight, weight_error, timecost,"\n")
         table = Texttable()
         name += ' ' * (16 - len(name))
 
@@ -125,7 +153,9 @@ class GPTQ:
         table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
         print(table.draw().split('\n')[-2])
 
+    #用於對層進行更快的量化
     def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name=''):
+        print("fasterquant")
         self.layer.to(self.dev)
 
         W = self.layer.weight.data.clone()
@@ -227,7 +257,9 @@ class GPTQ:
         zero = torch.cat(zero, dim=1)
         return scale, zero, g_idx, error
 
+    #用於釋放已使用的資源
     def free(self):
+        print("釋放已使用的資源")
         self.inp1 = None
         self.out1 = None
         self.H = None
